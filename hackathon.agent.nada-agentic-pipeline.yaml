@@ -1,0 +1,286 @@
+id: nada-agentic-pipeline
+namespace: hackathon.agent
+
+variables:
+  s3_bucket: "ai-agent-hackathon-2025"
+  s3_source_prefix: "nada-pdf-reports/"
+  s3_results_prefix: "nada-results/"
+  s3_csv_file_prefix: "Light_vehicle_statewise_sale_report.csv"
+inputs:
+  - id: user_question
+    type: STRING
+    description: "The question to ask the AI agent"
+    defaults: "When and how much of metal scrap will be produced for all the light vehicle sale in year 2024 and 2023 for All of the state mentioned in data."
+tasks:
+  #----------------------------------------------------------
+  # STEP 1: Find Files
+  #---------------------------------------
+  - id: list_s3_files
+    type: io.kestra.plugin.aws.s3.List
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    region: "us-east-1"
+    bucket: "{{ vars.s3_bucket }}"
+    prefix: "{{ vars.s3_source_prefix }}"
+    regexp: ".*\\.pdf"
+
+  #----------------------------------------------------------
+  # STEP 2: Analyze each PDF & Upload Result to S3
+  #---------------------------------------
+  - id: process_each_file
+    type: io.kestra.plugin.core.flow.ForEach
+    values: "{{ outputs.list_s3_files.objects | jq('.[].key') }}"
+    tasks:
+
+      - id: check_existing
+        type: io.kestra.plugin.aws.s3.List
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "us-east-1"
+        bucket: "{{ vars.s3_bucket}}"
+        prefix: "{{ vars.s3_results_prefix}}{{taskrun.value.replace('/','_')}}.json"
+      # 2a. Download PDF
+      - id: download_file
+        type: io.kestra.plugin.aws.s3.Download
+        runIf: "{{ outputs.check_existing[taskrun.value].objects | length == 0 }}"
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "us-east-1"
+        bucket: "{{ vars.s3_bucket }}"
+        key: "{{ taskrun.value }}"
+
+      # 2b. Analyze with Gemini
+      - id: analyze_with_gemini
+        type: io.kestra.plugin.scripts.python.Script
+        runIf: "{{ outputs.check_existing[taskrun.value].objects | length == 0 }}"
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: python:3.11-slim
+        beforeCommands:
+          - pip install -q -U google-genai
+        env:
+          GEMINI_API_KEY: "{{ secret('GEMINI_API_KEY') }}"
+          FILE_NAME: "{{ taskrun.value }}"
+        inputFiles:
+          input.pdf: "{{ outputs.download_file[taskrun.value].uri }}"
+        outputFiles:
+          - "result.json"
+        script: |
+          import os, json
+          from google import genai
+
+          client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+          file_upload = client.files.upload(file="input.pdf")
+
+          prompt = """
+          Analyze this NADA report. Extract structured data about:
+            1. Light Vehicle Lifespan/Age statistics.
+            2. Sales Volumes (New vs Used).
+            3. Mention of raw materials or recycling.
+            4. Light vehicles that will be discarded and sent to scrape.
+            5. Scraped metal out of the discarded cars in a particular year.
+            6. Number of New light vehicles sold or leased.
+          Return valid JSON only.
+          """
+
+          response = client.models.generate_content(
+              model="gemini-2.5-flash",
+              contents=[file_upload, prompt]
+          )
+
+          raw = response.text.replace("```json","").replace("```","").strip()
+
+          try:
+            data = json.loads(raw)
+            data["source"] = os.environ["FILE_NAME"]
+            print(f"--- SUCCESS: {os.environ['FILE_NAME']} ---")
+          except:
+            print(f"--- ERROR Parsing JSON for {os.environ['FILE_NAME']} ---")
+            data = {"source": os.environ["FILE_NAME"], "error": "Invalid JSON", "raw": raw}
+
+          with open("result.json", "w") as f:
+            json.dump(data, f)
+
+      # 2c. UPLOAD RESULT BACK TO S3 (FIXED KEY)
+      - id: upload_result_to_s3
+        type: io.kestra.plugin.aws.s3.Upload
+        runIf: "{{ outputs.check_existing[taskrun.value].objects | length == 0 }}"
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "us-east-1"
+        bucket: "{{ vars.s3_bucket }}"
+        # We use [taskrun.value] to pick the specific output from the previous parallel task
+        from: "{{ outputs.analyze_with_gemini[taskrun.value].outputFiles['result.json'] }}"
+        # FIX: Use Java .replace() method instead of the Pebble filter to avoid CastException
+        key: "{{ vars.s3_results_prefix }}{{ taskrun.value.replace('/', '_') }}.json"
+
+  #----------------------------------------------------------
+  # STEP 3a: Download Results from S3 (Separate Task)
+  #---------------------------------------
+  - id: download_results_from_s3
+    type: io.kestra.plugin.core.flow.WorkingDirectory
+    tasks:
+      #3a
+      - id: download_result_from_s3
+        type: io.kestra.plugin.aws.s3.Downloads
+        accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+        secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+        region: "us-east-1"
+        bucket: "{{ vars.s3_bucket }}"
+        prefix: "{{ vars.s3_results_prefix }}"
+        action: NONE
+
+  #----------------------------------------------------------
+  # STEP 3b: The Aggregator (FIXED)
+  #---------------------------------------
+  - id: aggregate_reports
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.11-slim
+
+    # Map the downloaded files. They will likely land in a subfolder named 'nada-results'
+    inputFiles: "{{ outputs.download_result_from_s3.outputFiles }}"
+
+    outputFiles:
+      - "master_pdf_report.json"
+
+    script: |
+      import json
+      import os
+
+      all_results = []
+      print("Starting aggregation...")
+      print(f"Current Directory Structure: {list(os.walk('.'))}") # Debug print
+
+      # FIX: Use os.walk to find JSON files in subdirectories
+      for root, dirs, files in os.walk("."):
+          for filename in files:
+              # Filter for JSONs, ignore the output file itself
+              if filename.endswith(".json") and filename != "master_pdf_report.json":
+                  filepath = os.path.join(root, filename)
+                  print(f"Reading file: {filepath}")
+                  
+                  try:
+                      with open(filepath, 'r') as f:
+                          data = json.load(f)
+                          all_results.append(data)
+                  except Exception as e:
+                      print(f"Skipping {filepath}: {e}")
+
+      final_report = {
+          "status": "success",
+          "processed_count": len(all_results),
+          "aggregated_data": all_results
+      }
+
+      print(f"Successfully aggregated {len(all_results)} reports.")
+
+      with open("master_pdf_report.json", "w") as f:
+        json.dump(final_report, f, indent=2)
+
+  - id: analyze_csv_report
+    type: io.kestra.plugin.jdbc.duckdb.Queries
+    description: Analyse csv report
+    sql: |
+      INSTALL httpfs;
+      LOAD httpfs;
+      SET s3_region = 'us-east-1';
+      SET s3_access_key_id = '{{ secret('AWS_ACCESS_KEY_ID') }}';
+      SET s3_secret_access_key = '{{ secret('AWS_SECRET_ACCESS_KEY') }}';
+
+      SELECT *
+      FROM read_csv_auto('s3://{{ vars.s3_bucket}}/{{ vars.s3_csv_file_prefix }}') 
+    fetchType: STORE
+    outputDbFile: true
+  #----------------------------------------------------------
+  # STEP 5 (NEW): Convert DuckDB output to CSV for Python
+  #---------------------------------------
+  - id: convert_duckdb_to_csv
+    type: io.kestra.plugin.serdes.csv.IonToCsv
+    description: Convert DuckDB query result to CSV format
+    from: "{{ outputs.analyze_csv_report.outputs[0].uri }}"
+    #
+    #----------------------------------------------------------
+    # STEP 5 (NEW): Convert DuckDB output to CSV for Python
+    #---------------------------------------
+
+  - id: final_gemini_analysis
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: python:3.13-slim
+    beforeCommands:
+      - pip install -q -U google-genai pandas
+    env:
+      GEMINI_API_KEY: "{{ secret('GEMINI_API_KEY') }}"
+      USER_QUERY: "{{ inputs.user_question }}"
+    inputFiles:
+      master_pdf_report.json: "{{ outputs.aggregate_reports.outputFiles }}"
+      csv_data.csv: "{{outputs.convert_duckdb_to_csv.uri}}"
+    outputFiles:
+      - "final_report_summary.txt"
+    script: |
+      import os
+      import json
+      import pandas as pd
+      from google import genai
+
+      client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+      user_query_str = os.environ["USER_QUERY"]
+      with open("master_pdf_report.json", "r") as f:
+          pdf_data = json.load(f)
+
+      # Load csv_data.csv
+      csv_df = pd.read_csv("csv_data.csv")
+
+      # Construct the detailed prompt
+      prompt_template = """
+      The following is aggregated data from NADA PDF reports (JSON format):
+      ```json
+      {pdf_data_json}
+      ```
+      The following is Light Vehicle Sale Report for each state (CSV format):
+      ```csv
+      {csv_data_csv}
+      ```
+      Additional context: A typical US car yields about 2,000 to 3,000 pounds (1 to 1.5 tons) of recyclable metal, with steel making up 55-65% of the weight, plus aluminum, copper, and other valuable metals like platinum in catalytic converters. The actual weight depends on the car's size, but you can expect roughly 70-75% of the car's total curb weight to be recyclable metal, with steel being the largest component. Vehicle is scraped after 13 years of use.
+      Analyse all of this data and answer the following question:
+      1) {user_query}
+      Give answer in textual form, one line for each state.
+      """
+      # Format the data into the prompt
+      pdf_data_str = json.dumps(pdf_data, indent=2)
+      csv_data_str = csv_df.to_csv(index=False)
+
+      full_prompt = prompt_template.format(
+          pdf_data_json=pdf_data_str,
+          csv_data_csv=csv_data_str,
+          user_query = user_query_str
+      )
+
+      print("Sending prompt to Gemini...")
+
+      # Using a generally available Gemini model for text generation
+      response = client.models.generate_content(
+          model="gemini-2.5-flash-lite", 
+          contents=[full_prompt]
+      )
+
+      final_answer = response.text
+      print("\n--- Gemini's Final Answer ---")
+      print(final_answer)
+      # Save the final answer to an output file
+      with open("final_report_summary.txt", "w") as f:
+        f.write(final_answer)
+  #----------------------------------------------------------
+  # STEP 7: Publish Result (For Web UI)
+  #---------------------------------------
+  - id: publish_to_s3
+    type: io.kestra.plugin.aws.s3.Upload
+    accessKeyId: "{{ secret('AWS_ACCESS_KEY_ID') }}"
+    secretKeyId: "{{ secret('AWS_SECRET_ACCESS_KEY') }}"
+    region: "us-east-1"
+    bucket: "{{ vars.s3_bucket }}"
+    from: "{{ outputs.final_gemini_analysis.outputFiles['final_report_summary.txt'] }}"
+    key: "final-output/latest_report.txt"
