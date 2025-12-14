@@ -270,7 +270,7 @@ tasks:
 
       final_answer = response.text
       print("\n--- Gemini's Final Answer ---")
-      print(final_answer
+      print(final_answer)
       with open("final_report_summary.txt", "w") as f:
         f.write(final_answer)
   #----------------------------------------------------------
