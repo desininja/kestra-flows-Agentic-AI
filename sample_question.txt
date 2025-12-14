@@ -1,0 +1,5 @@
+1) When and how much of metal scrap will be produced for all the light vehicle sale in year 2024 and 2023 for All of the state mentioned in data.
+2) Calculate the total scrap metal potential for Florida and California for all the light vehicle sale in year 2024.
+
+3) After adding Pennsylvania
+Calculate the total scrap metal potential for Pennsylvania for all the light vehicle sale in year 2024.
